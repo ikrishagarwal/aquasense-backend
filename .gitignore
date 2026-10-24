@@ -1,0 +1,48 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Generated JS from TypeScript (scripts/)
+/scripts/**/*.js
+/scripts/**/*.js.map
+/scripts/**/*.d.ts
+
+# Test output
+/test/**/*.js
+/test/**/*.js.map
+/test/**/*.d.ts
+coverage/
+.nyc_output/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Secrets
+secrets/
+
+# Logs
+*.log
+logs/
+pnpm-debug.log*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Supabase CLI local state
+supabase/.branches/
+supabase/.temp/
+.branches/
+.temp/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~

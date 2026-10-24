@@ -1,0 +1,62 @@
+### Set these variables in your REST Client before running the flow.
+@baseUrl = http://localhost:3000
+@token = replace-with-user-jwt
+@deviceId = replace-with-device-uuid
+@memberId = replace-with-member-uuid
+@sessionId = replace-with-guest-session-uuid
+
+### Health
+GET {{baseUrl}}/health
+
+### List devices
+GET {{baseUrl}}/v1/devices
+Authorization: Bearer {{token}}
+
+### Claim a device from its QR code
+POST {{baseUrl}}/v1/devices/claim
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "device_id": "{{deviceId}}"
+}
+
+### Add a household member (the user must already have signed up)
+POST {{baseUrl}}/v1/devices/{{deviceId}}/members
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "email": "member@example.com",
+  "role": "member"
+}
+
+### View members
+GET {{baseUrl}}/v1/devices/{{deviceId}}/members
+Authorization: Bearer {{token}}
+
+### View the dashboard summary
+GET {{baseUrl}}/v1/dashboard/{{deviceId}}
+Authorization: Bearer {{token}}
+
+### List guest sessions
+GET {{baseUrl}}/v1/sessions/guests?device_id={{deviceId}}
+Authorization: Bearer {{token}}
+
+### Assign a guest session to a member
+PUT {{baseUrl}}/v1/sessions/{{sessionId}}/assign
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "user_id": "{{memberId}}"
+}
+
+### Flush the purifier (owner only; requires a recent online telemetry status)
+POST {{baseUrl}}/v1/devices/{{deviceId}}/command
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "command": "flush"
+}
