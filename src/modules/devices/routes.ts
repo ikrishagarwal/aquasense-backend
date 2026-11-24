@@ -1,21 +1,38 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
+import { lifecycleStatus, tankState, telemetryPayloadSchema } from '../../ingestion/schemas.js';
 import { config } from '../../config.js';
 import { requireAuthenticated, requireMember, requireOwner } from '../../lib/access.js';
 import { AppError } from '../../lib/errors.js';
 
 const deviceId = z.string().uuid();
 const role = z.enum(['owner', 'member']);
-const command = z.enum(['flush', 'drain', 'reboot', 'update_firmware']);
+const commandStatus = z.union([z.enum(['pending', 'delivered']), lifecycleStatus]);
+const commandResult = z.object({ command_id: z.string().uuid(), status: commandStatus });
+const commandHistory = z.object({
+  revision: z.number().int(),
+  status: lifecycleStatus,
+  reason: z.string(),
+  timestamp: z.string(),
+  valve_state: z.enum(['commanded_open', 'commanded_closed']),
+});
+const drainErrors: Record<string, [number, string]> = {
+  DEVICE_NOT_FOUND: [404, 'The purifier does not exist'],
+  DEVICE_OWNER_REQUIRED: [403, 'Only the owner can request a drain'],
+  DEVICE_OFFLINE: [409, 'The purifier is offline'],
+  DEVICE_BUSY: [409, 'The purifier is busy'],
+  IDEMPOTENCY_CONFLICT: [409, 'The idempotency key was already used for a different request'],
+  COMMAND_RATE_LIMITED: [429, 'Wait before requesting another drain'],
+  INVALID_DRAIN: [400, 'Invalid drain request'],
+};
 
 const deviceSchema = z.object({
   id: deviceId,
   owner_id: z.string().uuid().nullable(),
   name: z.string(),
   status: z.enum(['offline', 'online', 'dispensing', 'flushing']),
-  tank_level_ml: z.number().int().nullable(),
-  current_tds: z.number().int().nullable(),
-  filter_life_liters: z.number().nullable(),
+  tank_state: tankState,
+  telemetry: telemetryPayloadSchema.nullable(),
   firmware_version: z.string().nullable(),
   last_seen_at: z.string().nullable(),
   created_at: z.string().nullable(),
@@ -41,7 +58,6 @@ function mapDevice(device: DeviceRow, memberRole: 'owner' | 'member') {
 }
 
 const devicesRoutes: FastifyPluginAsync = async (app) => {
-  const rateLimitByDevice = new Map<string, number>();
 
   app.get(
     '/v1/devices',
@@ -69,7 +85,7 @@ const devicesRoutes: FastifyPluginAsync = async (app) => {
 
       const { data: devices, error: deviceError } = await app.supabase
         .from('devices')
-        .select('id, owner_id, name, status, tank_level_ml, current_tds, filter_life_liters, firmware_version, last_seen_at, created_at')
+        .select('id, owner_id, name, status, tank_state, telemetry, firmware_version, last_seen_at, created_at')
         .in('id', rows.map((membership) => membership.device_id));
       if (deviceError) {
         throw databaseError('Unable to load devices', deviceError);
@@ -302,125 +318,58 @@ const devicesRoutes: FastifyPluginAsync = async (app) => {
     },
   );
 
-  app.post(
-    '/v1/devices/:device_id/command',
-    {
-      schema: {
-        tags: ['devices'],
-        summary: 'Send a command to a purifier',
-        params: z.object({ device_id: deviceId }),
-        body: z.object({ command }),
-        response: {
-          200: z.object({
-            command_id: z.string().uuid(),
-            status: z.enum(['delivered', 'completed', 'failed']),
-          }),
-        },
-      },
+  const commands = app.withTypeProvider<import('fastify-type-provider-zod').ZodTypeProvider>();
+  commands.post('/v1/devices/:device_id/command', {
+    schema: {
+      tags: ['devices'],
+      summary: 'Queue a confirmed drain request',
+      params: z.object({ device_id: deviceId }),
+      headers: z.object({ 'idempotency-key': z.string().min(1).max(128).regex(/^[!-~]+$/) }).passthrough(),
+      body: z.strictObject({
+        command: z.literal('drain'), duration_s: z.number().positive().max(config.DRAIN_MAX_DURATION_S),
+        confirmed: z.literal(true),
+      }),
+      response: { 202: commandResult },
     },
-    async (request) => {
-      const user = requireAuthenticated(request);
-      const params = request.params as { device_id: string };
-      const body = request.body as { command: 'flush' | 'drain' | 'reboot' | 'update_firmware' };
-      const membership = await requireMember(app.supabase, user.id, params.device_id);
-      if ((body.command === 'flush' || body.command === 'drain') && membership.role !== 'owner') {
-        throw new AppError(403, 'DEVICE_OWNER_REQUIRED', 'Only a device owner can flush or drain the purifier');
-      }
+  }, async (request, reply) => {
+    const user = requireAuthenticated(request);
+    const { data, error } = await app.supabase.rpc('request_drain', {
+      p_device: request.params.device_id,
+      p_owner: user.id,
+      p_key: request.headers['idempotency-key'],
+      p_duration: request.body.duration_s,
+      p_rate_ms: config.COMMAND_RATE_LIMIT_MS,
+      p_online_minutes: config.DEVICE_ONLINE_WINDOW_MINUTES,
+    });
+    if (error) throw databaseError('Unable to record drain request', error);
+    if (data?.error) {
+      const [status, message] = drainErrors[data.error] ?? [500, 'Unable to record drain request'];
+      throw new AppError(status, data.error, message);
+    }
+    return reply.code(202).send(commandResult.parse(data));
+  });
 
-      const lastCommandAt = rateLimitByDevice.get(params.device_id);
-      if (lastCommandAt !== undefined) {
-        const elapsed = Date.now() - lastCommandAt;
-        if (elapsed < config.COMMAND_RATE_LIMIT_MS) {
-          throw new AppError(429, 'COMMAND_RATE_LIMITED', 'Please wait before sending another command', {
-            retry_after_ms: config.COMMAND_RATE_LIMIT_MS - elapsed,
-          });
-        }
-      }
-
-      const { data: device, error: deviceError } = await app.supabase
-        .from('devices')
-        .select('status, last_seen_at')
-        .eq('id', params.device_id)
-        .maybeSingle();
-      if (deviceError) {
-        throw databaseError('Unable to load device state', deviceError);
-      }
-      if (!device) {
-        throw new AppError(404, 'DEVICE_NOT_FOUND', 'The requested device does not exist');
-      }
-      const currentDevice = device as { status: 'offline' | 'online' | 'dispensing' | 'flushing'; last_seen_at: string | null };
-      const lastSeenAt = currentDevice.last_seen_at ? new Date(currentDevice.last_seen_at).getTime() : Number.NaN;
-      const deviceIsOnline = currentDevice.status !== 'offline'
-        && Number.isFinite(lastSeenAt)
-        && Date.now() - lastSeenAt <= config.DEVICE_ONLINE_WINDOW_MINUTES * 60_000;
-      if (!deviceIsOnline) {
-        throw new AppError(409, 'DEVICE_OFFLINE', 'The purifier is not currently online');
-      }
-      if ((body.command === 'flush' || body.command === 'drain')
-        && (currentDevice.status === 'dispensing' || currentDevice.status === 'flushing')) {
-        throw new AppError(409, 'DEVICE_BUSY', 'The purifier is busy and cannot accept this command');
-      }
-
-      rateLimitByDevice.set(params.device_id, Date.now());
-      const { data: commandLog, error: insertError } = await app.supabase
-        .from('command_logs')
-        .insert({ device_id: params.device_id, issued_by: user.id, command: body.command, status: 'pending' })
-        .select('id, status')
-        .single();
-      if (insertError || !commandLog) {
-        throw databaseError('Unable to create command log', insertError ?? { message: 'No command log was returned' });
-      }
-
-      const commandId = (commandLog as { id: string }).id;
-      try {
-        await app.mqtt.publish(`device/${params.device_id}/commands`, {
-          command_id: commandId,
-          command: body.command,
-        });
-      } catch (error) {
-        await app.supabase
-          .from('command_logs')
-          .update({ status: 'failed' })
-          .eq('id', commandId)
-          .eq('status', 'pending');
-        throw error;
-      }
-
-      const { data: deliveredLog, error: deliveredError } = await app.supabase
-        .from('command_logs')
-        .update({ status: 'delivered' })
-        .eq('id', commandId)
-        .eq('status', 'pending')
-        .select('status')
-        .maybeSingle();
-      if (deliveredError) {
-        throw databaseError('Command was published but its log could not be updated', deliveredError);
-      }
-
-      if (deliveredLog) {
-        return {
-          command_id: commandId,
-          status: (deliveredLog as { status: 'delivered' | 'completed' | 'failed' }).status,
-        };
-      }
-
-      const { data: currentLog, error: currentLogError } = await app.supabase
-        .from('command_logs')
-        .select('status')
-        .eq('id', commandId)
-        .maybeSingle();
-      if (currentLogError || !currentLog) {
-        throw databaseError(
-          'Command was published but its final status could not be loaded',
-          currentLogError ?? { message: 'No command log was returned' },
-        );
-      }
-      return {
-        command_id: commandId,
-        status: (currentLog as { status: 'delivered' | 'completed' | 'failed' }).status,
-      };
+  commands.get('/v1/devices/:device_id/commands/:command_id', {
+    schema: {
+      tags: ['devices'],
+      params: z.object({ device_id: deviceId, command_id: deviceId }),
+      response: { 200: commandResult.extend({
+        command: z.string(), issued_at: z.string().nullable(), expires_at: z.string().nullable(),
+        broker_delivered_at: z.string().nullable(), history: z.array(commandHistory),
+      }) },
     },
-  );
+  }, async request => {
+    const user = requireAuthenticated(request);
+    const { device_id, command_id } = request.params;
+    await requireMember(app.supabase, user.id, device_id);
+    const { data, error } = await app.supabase.from('command_logs')
+      .select('command, status, issued_at, expires_at, broker_delivered_at, history:command_history(revision,status,reason,timestamp,valve_state)')
+      .eq('device_id', device_id).eq('id', command_id).maybeSingle();
+    if (error) throw databaseError('Unable to load command history', error);
+    if (!data) throw new AppError(404, 'COMMAND_NOT_FOUND', 'The command does not exist');
+    const history = commandHistory.array().parse(data.history).sort((a, b) => a.revision - b.revision);
+    return { command_id, ...data, status: commandStatus.parse(data.status), history };
+  });
 };
 
 export default devicesRoutes;

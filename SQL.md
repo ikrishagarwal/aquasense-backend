@@ -89,3 +89,5 @@ FOR INSERT WITH CHECK (
 -- supabase/migrations/002_device_members.sql
 -- Apply that migration after this base schema; it replaces the owner_id-only
 -- policies above with device_members-based access control.
+-- Apply supabase/migrations/003_edge_v1.sql next for the version 1 MQTT
+-- contract, command history, and alert outbox.

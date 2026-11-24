@@ -11,13 +11,26 @@ const sessionSchema = z.object({
   id: sessionId,
   device_id: deviceId,
   user_id: z.string().uuid().nullable(),
-  volume_ml: z.number().int().positive(),
-  avg_tds_out: z.number().int().nullable(),
+  volume_ml: z.number().nonnegative(),
+  avg_tds_out: z.number().nullable(),
   temperature_c: z.number().nullable(),
   start_ts: timestamp,
   end_ts: timestamp,
   created_at: timestamp.nullable(),
+  event_id: sessionId.nullable(),
+  revision: z.number().int().nullable(),
+  pulse_count: z.number().int().nullable(),
+  tds_in: z.number().nullable(),
+  ph_approx: z.number().nullable(),
+  sensor_quality: z.record(z.string(), z.string()).nullable(),
+  confidence: z.number().nullable(),
+  recognition_status: z.string().nullable(),
+  volume_quality: z.enum(['measured', 'uncalibrated']).nullable(),
+  incomplete: z.boolean().nullable(),
+  quality_flags: z.array(z.string()).nullable(),
 });
+
+const sessionColumns = 'id, device_id, user_id, volume_ml, avg_tds_out, temperature_c, start_ts, end_ts, created_at, event_id, revision, pulse_count, tds_in, ph_approx, sensor_quality, confidence, recognition_status, volume_quality, incomplete, quality_flags';
 
 function databaseError(message: string, error: { message: string }) {
   return new AppError(500, 'DATABASE_ERROR', message, error.message);
@@ -45,7 +58,7 @@ const sessionsRoutes: FastifyPluginAsync = async (app) => {
 
       let sessionsQuery = app.supabase
         .from('dispense_sessions')
-        .select('id, device_id, user_id, volume_ml, avg_tds_out, temperature_c, start_ts, end_ts, created_at')
+        .select(sessionColumns)
         .eq('device_id', query.device_id)
         .is('user_id', null)
         .order('start_ts', { ascending: false })
@@ -102,7 +115,7 @@ const sessionsRoutes: FastifyPluginAsync = async (app) => {
         .update({ user_id: body.user_id })
         .eq('id', params.id)
         .is('user_id', null)
-        .select('id, device_id, user_id, volume_ml, avg_tds_out, temperature_c, start_ts, end_ts, created_at')
+        .select(sessionColumns)
         .maybeSingle();
       if (error) {
         throw databaseError('Unable to assign dispense session', error);

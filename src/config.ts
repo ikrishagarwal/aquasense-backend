@@ -14,9 +14,11 @@ const envSchema = z.object({
   MQTT_ENABLED: z.enum(['true', 'false']).default('true').transform((value) => value === 'true'),
   DEVICE_ONLINE_WINDOW_MINUTES: z.coerce.number().positive().default(5),
   COMMAND_RATE_LIMIT_MS: z.coerce.number().int().nonnegative().default(10_000),
-  FILTER_ALERT_THRESHOLD_LITERS: z.coerce.number().nonnegative().default(50),
-  TANK_ALERT_THRESHOLD_ML: z.coerce.number().int().nonnegative().default(500),
+  DRAIN_MAX_DURATION_S: z.coerce.number().positive().max(15).default(15),
+  MQTT_CA_PATH: z.string().optional(),
   FCM_SERVICE_ACCOUNT_PATH: z.string().optional(),
+}).refine(env => !env.MQTT_ENABLED || /^mqtts:\/\//.test(env.MQTT_URL), {
+  path: ['MQTT_URL'], message: 'MQTT requires a verified mqtts:// connection',
 });
 
 export type AppConfig = z.infer<typeof envSchema>;

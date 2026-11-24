@@ -2,308 +2,98 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { FastifyBaseLogger } from 'fastify';
 import type { SupabaseClient } from '@supabase/supabase-js';
-import {
-  commandAckPayloadSchema,
-  deviceIdSchema,
-  sessionPayloadSchema,
-  statusPayloadSchema,
-} from '../src/ingestion/schemas.js';
+import { handleMqttMessage } from '../src/ingestion/handlers.js';
+import { telemetryPayloadSchema } from '../src/ingestion/schemas.js';
 
-// The handler imports configuration at module load time. These values keep the
-// unit tests self-contained and explicitly prevent any broker/database use.
-Object.assign(process.env, {
-  NODE_ENV: 'test',
-  SUPABASE_URL: 'https://unit-test.invalid',
-  SUPABASE_SERVICE_ROLE_KEY: 'unit-test-key',
-  MQTT_URL: 'mqtt://unit-test.invalid',
-  MQTT_USERNAME: 'unit-test-user',
-  MQTT_PASSWORD: 'unit-test-password',
-  MQTT_ENABLED: 'false',
-});
-
-const { handleMqttMessage } = await import('../src/ingestion/handlers.js');
-
-const deviceId = '11111111-1111-4111-8111-111111111111';
-const sessionId = '22222222-2222-4222-8222-222222222222';
-const commandId = '33333333-3333-4333-8333-333333333333';
-const timestamp = '2026-10-20T12:00:00.000Z';
-
-function validStatusPayload() {
-  return {
-    tds: 42,
-    tank_level_ml: 2_500,
-    filter_life_liters: 100,
-    status: 'online' as const,
-    firmware_version: '1.4.2',
-    ts: timestamp,
-  };
-}
-
-function validSessionPayload() {
-  return {
-    id: sessionId,
-    user_id: '44444444-4444-4444-8444-444444444444',
-    start_ts: timestamp,
-    end_ts: '2026-10-20T12:02:00.000Z',
-    volume_ml: 750,
-    avg_tds_out: 18,
-    temperature_c: 21.5,
-  };
-}
-
-function validCommandAckPayload() {
-  return {
-    command_id: commandId,
-    status: 'completed' as const,
-  };
-}
-
-type RecordedCall = {
-  operation: 'select' | 'update' | 'eq' | 'upsert';
-  table: string;
-  value?: unknown;
-  column?: string;
-  values?: unknown;
-  options?: unknown;
+const device_id = '11111111-1111-4111-8111-111111111111';
+const event_id = '22222222-2222-4222-8222-222222222222';
+const timestamp = '2026-10-20T12:00:00.000000+00:00';
+const event = {
+  schema_version: 1, device_id, event_id, revision: 1, user_id: 'guest',
+  start_ts: timestamp, end_ts: timestamp, volume_ml: 125.75, pulse_count: 12,
+  temperature_c: null, tds_in: null, tds_out: null, ph_approx: null,
+  sensor_quality: {
+    temperature_c: 'sensor_error', tds_in: 'stale', tds_out: 'sensor_error', ph_approx: 'sensor_error',
+  },
+  confidence: null, recognition_status: 'disabled', volume_quality: 'uncalibrated',
+  incomplete: true, quality_flags: ['interrupted'],
 };
+const wire = (message: unknown) => Buffer.from(JSON.stringify(message));
 
-type QueryResult = { data: unknown; error: null };
-
-class FakeQuery {
-  public constructor(
-    private readonly table: string,
-    private readonly calls: RecordedCall[],
-  ) {}
-
-  public select(value: string) {
-    this.calls.push({ operation: 'select', table: this.table, value });
-    return this;
-  }
-
-  public update(values: unknown) {
-    this.calls.push({ operation: 'update', table: this.table, values });
-    return this;
-  }
-
-  public eq(column: string, value: unknown) {
-    this.calls.push({ operation: 'eq', table: this.table, column, value });
-    return this;
-  }
-
-  public in(column: string, value: unknown) {
-    this.calls.push({ operation: 'eq', table: this.table, column, value });
-    return this;
-  }
-
-  public upsert(values: unknown, options: unknown) {
-    this.calls.push({ operation: 'upsert', table: this.table, values, options });
-    return Promise.resolve({ error: null });
-  }
-
-  public maybeSingle(): Promise<QueryResult> {
-    return Promise.resolve(this.result());
-  }
-
-  // Supabase query builders are awaitable. This lets the fake support the
-  // update(...).eq(...) calls without implementing a network client.
-  public then(onFulfilled: (result: QueryResult) => unknown) {
-    return Promise.resolve(this.result()).then(onFulfilled);
-  }
-
-  private result(): QueryResult {
-    if (this.table === 'devices') {
-      return { data: { id: deviceId }, error: null };
-    }
-    if (this.table === 'command_logs') {
-      return { data: { id: commandId }, error: null };
-    }
-    return { data: [], error: null };
-  }
-}
-
-function createContext() {
-  const calls: RecordedCall[] = [];
-  const warnings: unknown[][] = [];
-  const supabase = {
-    from(table: string) {
-      return new FakeQuery(table, calls);
-    },
-  } as unknown as SupabaseClient;
-  const logger = {
-    warn(...args: unknown[]) {
-      warnings.push(args);
-    },
-    info() {},
-    error() {},
-  } as unknown as FastifyBaseLogger;
-
-  return {
-    context: { supabase, logger },
-    calls,
-    warnings,
+function harness(result = 'committed', error: object | null = null) {
+  const calls: unknown[] = [];
+  const logs: unknown[] = [];
+  const context = {
+    supabase: {
+      async rpc(name: string, args: object) {
+        calls.push([name, args]);
+        return { data: result, error };
+      },
+    } as unknown as SupabaseClient,
+    logger: { warn(...args: unknown[]) { logs.push(args); } } as FastifyBaseLogger,
+    async publishCommitAck(...args: unknown[]) { calls.push(args); },
   };
+  return { calls, logs, context };
 }
 
-function callsFor(calls: RecordedCall[], operation: RecordedCall['operation'], table: string) {
-  return calls.filter((call) => call.operation === operation && call.table === table);
-}
-
-test('accepts valid status, session, and command-ack payloads', () => {
-  const status = statusPayloadSchema.safeParse(validStatusPayload());
-  assert.equal(status.success, true);
-  if (status.success) {
-    assert.deepEqual(status.data, validStatusPayload());
-  }
-
-  const session = sessionPayloadSchema.safeParse(validSessionPayload());
-  assert.equal(session.success, true);
-  if (session.success) {
-    assert.deepEqual(session.data, validSessionPayload());
-  }
-
-  const commandAck = commandAckPayloadSchema.safeParse(validCommandAckPayload());
-  assert.equal(commandAck.success, true);
-  if (commandAck.success) {
-    assert.deepEqual(commandAck.data, validCommandAckPayload());
-  }
+test('persists the unchanged guest payload and ACKs only after the transaction returns', async () => {
+  const { calls, context } = harness();
+  await handleMqttMessage(context, `purifier/${device_id}/events`, wire(event));
+  assert.deepEqual(calls, [
+    ['commit_edge_event', { p_kind: 'dispense', p_payload: event }],
+    [device_id, event_id, 1],
+  ]);
 });
 
-test('rejects invalid UUIDs, missing required fields, and out-of-range values', () => {
-  assert.equal(deviceIdSchema.safeParse('not-a-uuid').success, false);
-  assert.equal(
-    sessionPayloadSchema.safeParse({ ...validSessionPayload(), id: 'not-a-uuid' }).success,
-    false,
-  );
-  assert.equal(
-    commandAckPayloadSchema.safeParse({ ...validCommandAckPayload(), command_id: 'not-a-uuid' }).success,
-    false,
-  );
-
-  assert.equal(statusPayloadSchema.safeParse({ ...validStatusPayload(), tds: undefined }).success, false);
-  assert.equal(sessionPayloadSchema.safeParse({ ...validSessionPayload(), end_ts: undefined }).success, false);
-  assert.equal(commandAckPayloadSchema.safeParse({ ...validCommandAckPayload(), status: undefined }).success, false);
-
-  assert.equal(statusPayloadSchema.safeParse({ ...validStatusPayload(), tank_level_ml: -1 }).success, false);
-  assert.equal(sessionPayloadSchema.safeParse({ ...validSessionPayload(), volume_ml: 0 }).success, false);
+test('propagates transaction errors without acknowledgement', async () => {
+  const { calls, context } = harness('committed', { message: 'database unavailable' });
+  await assert.rejects(handleMqttMessage(context, `purifier/${device_id}/events`, wire(event)));
+  assert.equal(calls.length, 1);
 });
 
-test('handles a valid status payload through an in-memory Supabase boundary', async () => {
-  const { context, calls } = createContext();
-
-  await handleMqttMessage(
-    context,
-    `telemetry/status/${deviceId}`,
-    Buffer.from(JSON.stringify(validStatusPayload())),
-  );
-
-  const updates = callsFor(calls, 'update', 'devices');
-  assert.equal(updates.length, 1);
-  const values = updates[0]?.values as Record<string, unknown>;
-  assert.deepEqual(
-    {
-      current_tds: values.current_tds,
-      tank_level_ml: values.tank_level_ml,
-      status: values.status,
-      filter_life_liters: values.filter_life_liters,
-      firmware_version: values.firmware_version,
-    },
-    {
-      current_tds: 42,
-      tank_level_ml: 2_500,
-      status: 'online',
-      filter_life_liters: 100,
-      firmware_version: '1.4.2',
-    },
-  );
-  assert.equal(typeof values.last_seen_at, 'string');
-});
-
-test('uses the session UUID and ignore-duplicates upsert contract on retries', async () => {
-  const { context, calls } = createContext();
-  const payload = validSessionPayload();
-
-  await handleMqttMessage(
-    context,
-    `telemetry/sessions/${deviceId}`,
-    Buffer.from(JSON.stringify(payload)),
-  );
-  await handleMqttMessage(
-    context,
-    `telemetry/sessions/${deviceId}`,
-    Buffer.from(JSON.stringify(payload)),
-  );
-
-  const upserts = callsFor(calls, 'upsert', 'dispense_sessions');
-  assert.equal(upserts.length, 2);
-  for (const upsert of upserts) {
-    assert.deepEqual(upsert.values, {
-      id: sessionId,
-      device_id: deviceId,
-      user_id: '44444444-4444-4444-8444-444444444444',
-      start_ts: timestamp,
-      end_ts: '2026-10-20T12:02:00.000Z',
-      volume_ml: 750,
-      avg_tds_out: 18,
-      temperature_c: 21.5,
-    });
-    assert.deepEqual(upsert.options, { onConflict: 'id', ignoreDuplicates: true });
+test('ACKs exact duplicates and withholds ACKs for unknown devices, conflicts, and gaps', async () => {
+  for (const result of ['committed', 'unknown_device', 'conflict', 'revision_gap']) {
+    const { calls, context } = harness(result);
+    await handleMqttMessage(context, `purifier/${device_id}/events`, wire(event));
+    await handleMqttMessage(context, `purifier/${device_id}/events`, wire(event));
+    assert.equal(calls.length, result === 'committed' ? 4 : 2);
   }
 });
 
-test('handles a valid command acknowledgement payload', async () => {
-  const { context, calls } = createContext();
-
-  await handleMqttMessage(
-    context,
-    `device/${deviceId}/command_ack`,
-    Buffer.from(JSON.stringify(validCommandAckPayload())),
-  );
-
-  const updates = callsFor(calls, 'update', 'command_logs');
-  assert.equal(updates.length, 1);
-  const values = updates[0]?.values as Record<string, unknown>;
-  assert.equal(values.status, 'completed');
-  assert.equal(typeof values.updated_at, 'string');
-  assert.deepEqual(
-    callsFor(calls, 'eq', 'command_logs').map((call) => [call.column, call.value]),
-    [
-      ['id', commandId],
-      ['device_id', deviceId],
-      ['status', ['pending', 'delivered']],
-    ],
-  );
-});
-
-test('does not throw or touch Supabase for malformed JSON', async () => {
-  const { context, calls, warnings } = createContext();
-
-  await assert.doesNotReject(() =>
-    handleMqttMessage(
-      context,
-      `telemetry/status/${deviceId}`,
-      Buffer.from('{ definitely not JSON'),
-    ),
-  );
-
+test('rejects wrong-device, malformed, oversized, and unknown-field payloads without raw logs', async () => {
+  const { calls, logs, context } = harness();
+  const topic = `purifier/${device_id}/events`;
+  for (const payload of [
+    wire({ ...event, device_id: event_id }), Buffer.from('SENSITIVE malformed JSON'),
+    Buffer.alloc(16_385), wire({ ...event, unknown: true }), wire({ ...event, tds_in: 0 }),
+  ]) await handleMqttMessage(context, topic, payload);
   assert.equal(calls.length, 0);
-  assert.equal(warnings.length, 1);
-  assert.match(String(warnings[0]?.[1]), /malformed MQTT JSON/);
+  assert.equal(logs.length, 5);
+  assert.ok(!JSON.stringify(logs).includes('SENSITIVE'));
 });
 
-test('ignores malformed topic UUIDs and required fields before database access', async () => {
-  const { context, calls, warnings } = createContext();
+test('uses the same commit acknowledgement for lifecycle revisions', async () => {
+  const { calls, context } = harness();
+  const payload = {
+    schema_version: 1, device_id, event_id, command_id: event_id, revision: 2,
+    type: 'command_ack', status: 'rejected', reason: 'actuation_disabled', valve_state: 'commanded_closed', timestamp,
+  };
+  await handleMqttMessage(context, `purifier/${device_id}/ack`, wire(payload));
+  assert.deepEqual(calls, [
+    ['commit_edge_event', { p_kind: 'command_ack', p_payload: payload }],
+    [device_id, event_id, 2],
+  ]);
+});
 
-  await handleMqttMessage(
-    context,
-    'telemetry/status/not-a-uuid',
-    Buffer.from(JSON.stringify(validStatusPayload())),
-  );
-  await handleMqttMessage(
-    context,
-    `telemetry/sessions/${deviceId}`,
-    Buffer.from(JSON.stringify({ ...validSessionPayload(), end_ts: undefined })),
-  );
-
-  assert.equal(calls.length, 0);
-  assert.equal(warnings.length, 2);
+test('accepts the current Pi telemetry health and nullable sensor format', () => {
+  assert.ok(telemetryPayloadSchema.safeParse({
+    schema_version: 1, device_id, timestamp, tank_state: 'UNKNOWN', sensors: {
+      tds_in: { value: null, quality: 'stale', unit: 'ppm', timestamp },
+    },
+    health: {
+      core_rss_kib: 512, cpu_temperature_c: null, disk_free_bytes: 123, writer_depth: 0,
+      storage_healthy: true, throttling: null, vision: 'disabled', mqtt: 'connected',
+      pending_outbox: 0, sqlite_integrity: null,
+    },
+  }).success);
 });

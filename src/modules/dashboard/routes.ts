@@ -1,5 +1,6 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
+import { tankState, telemetryPayloadSchema } from '../../ingestion/schemas.js';
 import { requireAuthenticated, requireMember } from '../../lib/access.js';
 import { AppError } from '../../lib/errors.js';
 
@@ -9,13 +10,13 @@ const dashboardSchema = z.object({
   device_id: deviceId,
   name: z.string(),
   status: z.enum(['offline', 'online', 'dispensing', 'flushing']),
-  tank_level_ml: z.number().int().nullable(),
-  current_tds: z.number().int().nullable(),
-  filter_life_liters: z.number().nullable(),
+  tank_state: tankState,
+  telemetry: telemetryPayloadSchema.nullable(),
   firmware_version: z.string().nullable(),
   last_seen_at: z.string().nullable(),
-  water_consumed_today_ml: z.number().int(),
-  water_consumed_week_ml: z.number().int(),
+  water_consumed_today_ml: z.number(),
+  water_consumed_week_ml: z.number(),
+  filter_usage_ml: z.number(),
   session_count_today: z.number().int(),
 });
 
@@ -37,7 +38,7 @@ const dashboardRoutes: FastifyPluginAsync = async (app) => {
 
       const { data, error } = await app.supabase
         .from('dashboard_summary')
-        .select('device_id, name, status, tank_level_ml, current_tds, filter_life_liters, firmware_version, last_seen_at, water_consumed_today_ml, water_consumed_week_ml, session_count_today')
+        .select('device_id, name, status, tank_state, telemetry, firmware_version, last_seen_at, water_consumed_today_ml, water_consumed_week_ml, session_count_today, filter_usage_ml')
         .eq('device_id', params.device_id)
         .maybeSingle();
       if (error) {

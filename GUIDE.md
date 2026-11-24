@@ -21,10 +21,8 @@ Fastify backend
   └── MQTT client: subscribe to telemetry and publish commands
 
 Raspberry Pi / mock publisher
-  ├── telemetry/status/<device_uuid>
-  ├── telemetry/sessions/<device_uuid>
-  ├── device/<device_uuid>/command_ack
-  └── device/<device_uuid>/commands
+  ├── publishes purifier/<device_uuid>/{events,telemetry,ack,status}
+  └── subscribes to purifier/<device_uuid>/{events_ack,cmd}
 ```
 
 ## 1. Prerequisites
@@ -75,9 +73,8 @@ If Supabase is configured but MQTT is not ready yet, set:
 MQTT_ENABLED=false
 ```
 
-The backend will start without connecting to MQTT. REST routes that need
-command publication will return `503 MQTT_UNAVAILABLE` until MQTT is enabled.
-Telemetry ingestion will not happen while MQTT is disabled.
+The backend starts without MQTT. Telemetry ingestion and drain dispatch require
+a broker connection. An undispatched drain request expires after 15 seconds.
 
 ### Important secret rule
 
@@ -137,6 +134,8 @@ If using the Supabase CLI, run the migration through your normal linked-project
 workflow. If using the dashboard, paste the file into the SQL Editor and run
 it once after `SQL.md`.
 
+Apply `supabase/migrations/003_edge_v1.sql` after the membership migration.
+
 ### 3.4 Enable authentication
 
 In Supabase Dashboard → Authentication → Providers:
@@ -184,17 +183,9 @@ the actual Supabase `devices.id` value.
 
 ### 4.1 Create broker credentials
 
-Create a backend MQTT user with permission to:
-
-- Subscribe to `telemetry/status/+`.
-- Subscribe to `telemetry/sessions/+`.
-- Subscribe to `device/+/command_ack`.
-- Publish to `device/+/commands`.
-
-Create device credentials or ACLs so each Raspberry Pi can publish only to its
-own telemetry topics and subscribe only to its own command topic. The current
-backend validates UUIDs and registered devices, but MQTT credentials/ACLs are
-still required to prevent one device from impersonating another.
+Use separate credentials for the backend and each device, with the topic ACLs
+in the [MQTT contract](README.md#mqtt-contract). Clear retained commands
+before cutover.
 
 ### 4.2 Put broker values in `.env`
 
@@ -212,16 +203,8 @@ plugin uses QoS 1 subscriptions and reconnects after a connection loss.
 
 ### 4.3 Backend subscriptions
 
-At startup the backend subscribes to:
-
-```text
-telemetry/status/+
-telemetry/sessions/+
-device/+/command_ack
-```
-
-The `+` segment must contain the Supabase device UUID. The backend ignores
-unknown devices and malformed payloads rather than crashing the process.
+The backend subscribes to `purifier/+/events`, `purifier/+/ack`, and
+`purifier/+/status` at QoS 1, and `purifier/+/telemetry` at QoS 0.
 
 ## 5. Start and verify the backend
 
@@ -403,7 +386,8 @@ await apiRequest(`/v1/devices/${deviceId}/members`, accessToken, {
 // Send a command.
 await apiRequest(`/v1/devices/${deviceId}/command`, accessToken, {
   method: 'POST',
-  body: JSON.stringify({ command: 'flush' }),
+  headers: { 'Idempotency-Key': crypto.randomUUID() },
+  body: JSON.stringify({ command: 'drain', duration_s: 5, confirmed: true }),
 });
 ```
 
@@ -441,142 +425,18 @@ The authenticated client still needs to be allowed to read the device by the
 membership RLS policy. A user who is not a member should not receive that
 device's direct Realtime data.
 
-## 9. Connect a real Raspberry Pi
+## 9. Connect a Raspberry Pi in simulation
 
-The firmware needs:
-
-- The broker URL and device-specific credentials.
-- The registered Supabase device UUID.
-- The exact topic names below.
-- A locally generated UUID for every completed dispense session.
-- A local retry queue for sessions when Wi-Fi or MQTT is unavailable.
-
-### Publish status
-
-```text
-Topic: telemetry/status/<device_uuid>
-```
-
-```json
-{
-  "tds": 42,
-  "tank_level_ml": 2500,
-  "filter_life_liters": 100,
-  "status": "online",
-  "firmware_version": "1.4.2",
-  "ts": "2026-10-20T12:00:00.000Z"
-}
-```
-
-Publish status periodically. The backend uses `ts` to reject older packets,
-and updates `last_seen_at` only after accepting a message.
-
-### Publish a completed session
-
-```text
-Topic: telemetry/sessions/<device_uuid>
-```
-
-```json
-{
-  "id": "a-uuid-generated-on-the-rpi",
-  "user_id": null,
-  "start_ts": "2026-10-20T12:00:00.000Z",
-  "end_ts": "2026-10-20T12:02:00.000Z",
-  "volume_ml": 750,
-  "avg_tds_out": 18,
-  "temperature_c": 21.5
-}
-```
-
-The Raspberry Pi must keep the same `id` when retrying the same event. Do not
-generate a new UUID for every retry.
-
-### Subscribe for commands
-
-```text
-Topic: device/<device_uuid>/commands
-```
-
-The backend publishes:
-
-```json
-{
-  "command_id": "command-log-uuid",
-  "command": "flush"
-}
-```
-
-The firmware should execute the command and publish:
-
-```text
-Topic: device/<device_uuid>/command_ack
-```
-
-```json
-{
-  "command_id": "command-log-uuid",
-  "status": "completed"
-}
-```
-
-Use `failed` when the command cannot execute. Always echo the exact
-`command_id`; it is how the backend joins the ACK to `command_logs`.
+Use a registered device UUID and verified MQTT TLS. Follow the
+[version 1 MQTT contract](README.md#mqtt-contract) and the adjacent edge
+project's simulation setup. Confirm durable event replay and a rejected drain
+with reason `actuation_disabled`.
 
 ## 10. Use the mock Raspberry Pi
 
-The mock publisher is useful before firmware is ready. It publishes status and
-session messages but does not execute commands or publish ACKs.
-
-Set the device UUID and run it from a second terminal:
-
-```bash
-DEVICE_ID=<registered-device-uuid> pnpm mock-rpi
-```
-
-Optional interval override:
-
-```bash
-DEVICE_ID=<registered-device-uuid> \
-MOCK_RPI_INTERVAL_MS=2000 \
-pnpm mock-rpi
-```
-
-The script reads the MQTT URL, username, and password from `.env`. It:
-
-1. Publishes an initial online status.
-2. Publishes status every interval.
-3. Publishes a simulated 250 ml dispense session every interval.
-4. Decreases the simulated tank and filter values.
-
-Watch the backend logs for accepted telemetry. Then call the dashboard route
-to see the persisted values:
-
-```bash
-curl "http://localhost:3000/v1/dashboard/<device_uuid>" \
-  -H "Authorization: Bearer $ACCESS_TOKEN"
-```
-
-## 11. Run the complete demo story
-
-Use this order for a judge/demo presentation:
-
-1. Start Supabase and confirm the migration is applied.
-2. Start HiveMQ credentials and confirm the broker URL works.
-3. Start the backend with `pnpm dev`.
-4. Create or sign in as the owner.
-5. Insert one unclaimed device and save its UUID.
-6. Claim the device from the app or `POST /v1/devices/claim`.
-7. Create/sign in as the second user, then add that user's email as a member.
-8. Start the mock RPi or real firmware.
-9. Show the dashboard updating through Supabase Realtime.
-10. Show a guest session in `GET /v1/sessions/guests`.
-11. Assign it to the member with `PUT /v1/sessions/:id/assign`.
-12. Send `flush` as the owner.
-13. Show the `pending`/`delivered` command log and publish an ACK.
-14. Show the final `completed` command status.
-
-The request sequence is also available in [`docs/demo.http`](./docs/demo.http).
+Set `DEVICE_ID` to a registered UUID and use that device's credentials when
+running `pnpm mock-rpi`. See the [demo requests](docs/demo.http) for a drain
+request and the [demo flow](README.md#running-the-demo-flow) for verification.
 
 ## 12. Troubleshooting
 
@@ -634,9 +494,9 @@ Check:
 1. The topic UUID is a valid UUID.
 2. That UUID exists in `public.devices`.
 3. The JSON property names match the contract exactly.
-4. `ts`, `start_ts`, and `end_ts` include a timezone offset, for example
+4. `timestamp`, `start_ts`, and `end_ts` include a UTC timezone offset, for example
    `2026-10-20T12:00:00.000Z`.
-5. The status message is newer than `last_telemetry_at`.
+5. The telemetry timestamp is newer than `last_telemetry_at`.
 6. The backend is subscribed to the exact topic prefix.
 
 Malformed messages are logged and skipped. A malformed message does not stop
@@ -644,9 +504,9 @@ the MQTT client.
 
 ### Sessions are duplicated
 
-The same session must be retried with the same `id`. If the firmware generates
+The same session must be retried with the same `event_id`. If the firmware generates
 a new UUID for every retry, the database correctly treats those as different
-dispenses. Confirm the base `dispense_sessions.id` primary key exists.
+dispenses. Confirm migration `003_edge_v1.sql` is applied.
 
 ### A command returns `DEVICE_OFFLINE`
 
@@ -658,10 +518,10 @@ The device must have:
 
 Start the mock publisher or publish a valid status message first.
 
-### A flush or drain returns `DEVICE_BUSY`
+### A drain returns `DEVICE_BUSY`
 
-The interlock intentionally rejects `flush` and `drain` while the device is
-`dispensing` or `flushing`. Wait for a later `online` status update.
+The backend rejects requests while a device reports a busy state. The Pi
+independently evaluates its local interlocks.
 
 ### Adding a member returns `PROFILE_NOT_FOUND`
 
@@ -690,9 +550,8 @@ Check:
 
 ### FCM alerts do not arrive
 
-This is currently expected. The notification layer is a logging stub. The
-backend logs that an alert was queued and how many device members were found,
-but it does not send a Firebase push notification yet.
+Verify the service account path and permissions, register the app token, and
+check the worker logs and `alert_outbox` / `alert_deliveries` tables.
 
 ## 13. Run checks before handing off
 
@@ -736,7 +595,7 @@ Before production or a public demo:
 - Configure database backups and retention.
 - Add durable ingestion storage if MQTT/database outages must survive process
   restarts.
-- Implement Firebase Admin/FCM delivery before promising push notifications.
+- Configure FCM credentials and verify mobile token registration and delivery.
 - Run a real broker and Supabase integration test.
 
 ## Reference files

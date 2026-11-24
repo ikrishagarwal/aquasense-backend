@@ -44,7 +44,7 @@ Not yet connected to external services in this workspace:
 
 - The migration still needs to be applied to the real Supabase project.
 - A real HiveMQ/Mosquitto end-to-end test still needs to be run.
-- FCM is currently a safe logging stub; no push notification is sent yet.
+- FCM delivery requires a service account and registered mobile tokens.
 
 ## Architecture
 
@@ -90,10 +90,8 @@ There are two different Supabase clients in the overall system:
 
 Device roles are stored in `device_members`, not on the profile:
 
-- `owner`: manages members, device settings, and owner-only commands such as
-  `flush` and `drain`.
-- `member`: views shared devices and sessions and can issue the household
-  commands allowed by the current API.
+- `owner`: manages members and can request a drain.
+- `member`: views shared devices, sessions, and command history.
 
 The SQL migration also installs membership-based RLS as a defense-in-depth
 backstop for direct Supabase client access.
@@ -184,9 +182,10 @@ Run the base statements in [`SQL.md`](./SQL.md), then run:
 
 ```text
 supabase/migrations/002_device_members.sql
+supabase/migrations/003_edge_v1.sql
 ```
 
-You can paste both into the Supabase SQL Editor or apply them with the
+You can paste these into the Supabase SQL Editor or apply them with the
 Supabase CLI. The migration assumes the base tables from `SQL.md` already
 exist.
 
@@ -251,9 +250,9 @@ required value is missing.
 | `MQTT_ENABLED` | No | `true` | Set to `false` for HTTP-only local smoke tests. |
 | `DEVICE_ONLINE_WINDOW_MINUTES` | No | `5` | Maximum age of a device heartbeat for commands. |
 | `COMMAND_RATE_LIMIT_MS` | No | `10000` | Minimum time between commands for one device. |
-| `FILTER_ALERT_THRESHOLD_LITERS` | No | `50` | Filter low-life threshold. |
-| `TANK_ALERT_THRESHOLD_ML` | No | `500` | Tank low-level threshold. |
-| `FCM_SERVICE_ACCOUNT_PATH` | No | — | Reserved configuration for future FCM delivery. The current implementation logs alerts instead. |
+| `DRAIN_MAX_DURATION_S` | No | `15` | Maximum accepted drain duration in seconds (up to 15). |
+| `MQTT_CA_PATH` | No | — | PEM CA certificate for private brokers. |
+| `FCM_SERVICE_ACCOUNT_PATH` | No | — | Firebase service account JSON for mobile alert delivery. |
 | `DEVICE_ID` | Mock only | — | Device UUID used by `pnpm mock-rpi`. |
 | `MOCK_RPI_INTERVAL_MS` | Mock only | `5000` | Mock publisher interval. |
 
@@ -405,9 +404,8 @@ GET /v1/dashboard/:device_id
 Returns the device snapshot and aggregation from `dashboard_summary`:
 
 - `status`
-- `tank_level_ml`
-- `current_tds`
-- `filter_life_liters`
+- `tank_state` and `telemetry` (including sensor quality and reading timestamps)
+- `filter_usage_ml` (sum from calibrated sessions)
 - `firmware_version`
 - `last_seen_at`
 - `water_consumed_today_ml`
@@ -440,155 +438,54 @@ The caller must own the session's device, and the target user must be a member
 of that device. A session already assigned by another request returns
 `409 SESSION_ALREADY_ASSIGNED`.
 
-### Send a device command
+### Request a drain
 
 ```http
 POST /v1/devices/:device_id/command
 Content-Type: application/json
+Idempotency-Key: <unique-key-for-this-confirmed-request>
 
-{"command":"flush"}
+{"command":"drain","duration_s":5,"confirmed":true}
 ```
 
-Allowed commands:
+Only owners can request a drain. The app sends this request after explicit user
+confirmation. The response is `202` with the command ID and current status.
+Reuse the same key and request body on HTTP retry. A changed duration with the
+same key returns `409`. Each command has a 15-second dispatch window.
 
-- `flush`
-- `drain`
-- `reboot`
-- `update_firmware`
+Members can call `GET /v1/devices/:device_id/commands/:command_id` for expiry,
+broker delivery time, and the Pi's ordered lifecycle history. Broker delivery
+and valve command state are separate from the Pi's acceptance and from physical
+drainage. A pending command past its expiry has an unconfirmed outcome.
 
-The command route checks, in order:
+### Register for mobile alerts
 
-1. The caller is a device member.
-2. `flush` and `drain` are issued by an owner.
-3. The device has a recent heartbeat and is not `offline`.
-4. `flush` and `drain` are not sent while the device is `dispensing` or
-   `flushing`.
-5. The device has not exceeded its in-memory command rate limit.
-
-The route creates a `pending` command log, publishes the MQTT command, and
-transitions the log to `delivered`. The Raspberry Pi must publish a command
-acknowledgement to transition it to `completed` or `failed`.
+Send `PUT /v1/notifications/token` with `{"token":"<fcm-token>"}` using the
+user's bearer token. Send `DELETE` with the same body on sign-out or token
+replacement. Configure `FCM_SERVICE_ACCOUNT_PATH` to send alerts. Use
+`event_id` from the FCM data payload to deduplicate delivery on the client.
 
 ## MQTT contract
 
-The MQTT topic segments use the Supabase `devices.id` UUID. Do not use a
-human-readable device name or a separate Raspberry Pi serial number in these
-topics unless the contract is changed in both the backend and firmware.
+Use the registered `devices.id` UUID in `purifier/{device_id}/...` and verified
+`mqtts://` for both backend and edge connections.
 
-### Backend subscriptions
+| Suffix | Direction | QoS | Purpose |
+| --- | --- | --- | --- |
+| `events` | Pi → backend | 1 | Dispense sessions and alert transitions |
+| `telemetry` | Pi → backend | 0 | Threshold tank, sensors, health |
+| `ack` | Pi → backend | 1 | Command lifecycle revisions |
+| `status` | Pi → backend | 1 | Retained availability and LWT |
+| `events_ack` | Backend → Pi | 1 | Event revision committed to Postgres |
+| `cmd` | Backend → Pi | 1 | Expiring drain request, non-retained |
 
-The backend subscribes at startup with QoS 1 to:
-
-```text
-telemetry/status/+
-telemetry/sessions/+
-device/+/command_ack
-```
-
-Malformed JSON, invalid topics, and invalid payloads are logged and skipped so
-one bad message does not poison the subscription.
-
-### Status telemetry: Raspberry Pi → backend
-
-Topic:
-
-```text
-telemetry/status/<device-uuid>
-```
-
-Payload:
-
-```json
-{
-  "tds": 42,
-  "tank_level_ml": 2500,
-  "filter_life_liters": 100,
-  "status": "online",
-  "firmware_version": "1.4.2",
-  "ts": "2026-10-20T12:00:00.000Z"
-}
-```
-
-Rules:
-
-- `tds` and `tank_level_ml` are non-negative integers.
-- `filter_life_liters` and `firmware_version` are optional.
-- `status` is `offline`, `online`, `dispensing`, or `flushing`.
-- `ts` must be an ISO timestamp with an offset.
-- The device must already exist in Supabase.
-- Older status messages than `last_telemetry_at` are ignored.
-- Accepted messages update the device snapshot and last-seen timestamps.
-
-### Dispense session telemetry: Raspberry Pi → backend
-
-Topic:
-
-```text
-telemetry/sessions/<device-uuid>
-```
-
-Payload:
-
-```json
-{
-  "id": "22222222-2222-4222-8222-222222222222",
-  "user_id": null,
-  "start_ts": "2026-10-20T12:00:00.000Z",
-  "end_ts": "2026-10-20T12:02:00.000Z",
-  "volume_ml": 750,
-  "avg_tds_out": 18,
-  "temperature_c": 21.5
-}
-```
-
-Rules:
-
-- `id` is generated by the Raspberry Pi and is the idempotency key.
-- `end_ts` is required because the backend stores completed sessions.
-- `volume_ml` must be greater than zero.
-- `user_id` is optional. Unknown or non-member users are stored as guests.
-- The backend uses an `id` conflict-safe upsert, so batch retries do not
-  create duplicate sessions.
-
-### Device command: backend → Raspberry Pi
-
-Topic:
-
-```text
-device/<device-uuid>/commands
-```
-
-Payload:
-
-```json
-{
-  "command_id": "33333333-3333-4333-8333-333333333333",
-  "command": "flush"
-}
-```
-
-The Raspberry Pi must preserve and echo `command_id` in its acknowledgement.
-
-### Command acknowledgement: Raspberry Pi → backend
-
-Topic:
-
-```text
-device/<device-uuid>/command_ack
-```
-
-Payload:
-
-```json
-{
-  "command_id": "33333333-3333-4333-8333-333333333333",
-  "status": "completed"
-}
-```
-
-`status` must be `completed` or `failed`. The backend only updates command
-logs that are still `pending` or `delivered`, so a terminal acknowledgement
-cannot be downgraded by a later REST update.
+Configure each Pi credential to publish and subscribe only to its assigned
+directions and UUID. Reserve publishing `cmd` and `events_ack` for the backend.
+Clear old retained commands before allowing device subscriptions at cutover.
+Deploy the migration before starting version 1 consumers. Switch the edge and
+backend topics together and update app response handling for threshold tank
+state, nullable readings and fractional volumes. See [BACKEND.md](BACKEND.md)
+for the payload contract.
 
 ## Database contract
 
@@ -623,7 +520,8 @@ this order:
 
 1. Base schema from `SQL.md`.
 2. `supabase/migrations/002_device_members.sql`.
-3. Supabase Auth and Realtime dashboard configuration.
+3. `supabase/migrations/003_edge_v1.sql`.
+4. Supabase Auth and Realtime dashboard configuration.
 
 The migration backfills profiles from existing `auth.users` rows and creates
 memberships for existing non-null `devices.owner_id` values.
@@ -706,9 +604,8 @@ provide a WebSocket endpoint of its own.
 7. Start `pnpm mock-rpi` with the registered device UUID.
 8. Watch the dashboard update from status messages.
 9. List guest sessions and assign one to the member.
-10. Send `flush` as the owner.
-11. Have the Raspberry Pi or a test MQTT client publish the command ACK.
-12. Confirm the command log reaches `completed`.
+10. Send a confirmed drain request as the owner.
+11. Confirm receipt and rejection with reason `actuation_disabled`.
 
 The same sequence is prepared in [`docs/demo.http`](./docs/demo.http), which
 works with VS Code REST Client and compatible HTTP clients. Replace the
@@ -716,16 +613,15 @@ variables at the top before running the requests.
 
 ### Mock Raspberry Pi
 
-The mock publisher needs the same broker credentials as the backend and a
+The mock publisher needs dedicated device broker credentials and a
 known device UUID:
 
 ```bash
 DEVICE_ID=11111111-1111-4111-8111-111111111111 pnpm mock-rpi
 ```
 
-It publishes an initial status and then publishes status plus a 250 ml session
-at the configured interval. It does not emulate command acknowledgements; a
-real firmware client or a separate MQTT test publisher must do that.
+It publishes retained availability, telemetry, and fractional sessions. It
+retries unacknowledged revisions in memory and simulates drain rejection.
 
 ## Tests and verification
 
@@ -755,7 +651,9 @@ test or a live broker test. After applying the migration, manually verify:
 - Direct client RLS policies behave as intended.
 - A status message updates the device row and emits Realtime.
 - Repeating a session message leaves one session row.
-- A command reaches the broker and its ACK reaches `completed`.
+- A simulated drain reaches the Pi and its received and rejected revisions commit.
+
+Run `psql -v ON_ERROR_STOP=1 -f test/edge-v1.sql` against a migrated test database for commit, revision, drain and outbox assertions. The fixtures roll back.
 
 ## Operational notes and limitations
 
@@ -774,19 +672,12 @@ device topics and each device can publish/subscribe only to its own topics.
 The topic UUID is validated, but it is not by itself cryptographic device
 identity.
 
-### FCM
+### Delivery monitoring
 
-`FCM_SERVICE_ACCOUNT_PATH` is accepted for future notification delivery, but
-`src/lib/fcm.ts` currently logs alert fan-out rather than sending push
-notifications. Do not describe FCM as active until the Firebase Admin SDK and
-device-token storage are added.
-
-### MQTT retries
-
-The backend retries failed message processing a small number of times with
-backoff. The Raspberry Pi should still retain events locally and republish
-unacknowledged messages, as described in the product plan. The session UUID
-makes those retries safe.
+Watch backend logs for failed commits, commit ACKs, and dispatch attempts.
+In Postgres, monitor expired pending `command_logs`, unexpanded
+`alert_outbox` rows and unfinished `alert_deliveries`. If FCM credentials
+are absent, alert jobs remain queued.
 
 ### Realtime
 

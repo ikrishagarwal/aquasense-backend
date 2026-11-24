@@ -52,11 +52,14 @@ Content-Type: application/json
   "user_id": "{{memberId}}"
 }
 
-### Flush the purifier (owner only; requires a recent online telemetry status)
+### Request a confirmed drain (owner only)
 POST {{baseUrl}}/v1/devices/{{deviceId}}/command
 Authorization: Bearer {{token}}
 Content-Type: application/json
+Idempotency-Key: demo-drain-1
 
-{
-  "command": "flush"
-}
+{"command":"drain","duration_s":5,"confirmed":true}
+
+### Read the command lifecycle (replace the ID with the POST response)
+GET {{baseUrl}}/v1/devices/{{deviceId}}/commands/REPLACE_WITH_COMMAND_ID
+Authorization: Bearer {{token}}

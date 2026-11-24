@@ -13,6 +13,8 @@ import { z, ZodError } from 'zod';
 import { config } from './config.js';
 import supabasePlugin from './plugins/supabase.js';
 import authPlugin from './plugins/auth.js';
+import edgeWorkers from './plugins/edge-workers.js';
+import notificationsRoutes from './modules/notifications/routes.js';
 import mqttPlugin from './plugins/mqtt.js';
 import healthRoutes from './modules/health/routes.js';
 import devicesRoutes from './modules/devices/routes.js';
@@ -91,6 +93,8 @@ export async function buildApp() {
   await app.register(supabasePlugin);
   await app.register(authPlugin);
   await app.register(mqttPlugin);
+  await app.register(edgeWorkers);
+  await app.register(notificationsRoutes);
   await app.register(healthRoutes);
   await app.register(devicesRoutes);
   await app.register(sessionsRoutes);
