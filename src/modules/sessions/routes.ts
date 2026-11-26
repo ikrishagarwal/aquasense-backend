@@ -32,6 +32,7 @@ const sessionSchema = z.object({
 });
 
 const sessionColumns = 'id, device_id, user_id, recognized_user_id, volume_ml, avg_tds_out, temperature_c, start_ts, end_ts, created_at, event_id, revision, pulse_count, tds_in, ph_approx, sensor_quality, confidence, recognition_status, volume_quality, incomplete, quality_flags';
+const guestSessionSchema = sessionSchema.extend({ recognized_user_name: z.string().nullable() });
 
 function databaseError(message: string, error: { message: string }) {
   return new AppError(500, 'DATABASE_ERROR', message, error.message);
@@ -49,7 +50,7 @@ const sessionsRoutes: FastifyPluginAsync = async (app) => {
           limit: z.coerce.number().int().min(1).max(100).default(25),
           before: timestamp.optional(),
         }),
-        response: { 200: z.object({ sessions: z.array(sessionSchema), next_before: timestamp.nullable() }) },
+        response: { 200: z.object({ sessions: z.array(guestSessionSchema), next_before: timestamp.nullable() }) },
       },
     },
     async (request) => {
@@ -73,8 +74,28 @@ const sessionsRoutes: FastifyPluginAsync = async (app) => {
         throw databaseError('Unable to load guest sessions', error);
       }
       const sessions = (data ?? []) as z.infer<typeof sessionSchema>[];
+      const ids = new Set(sessions.map((session) => session.recognized_user_id).filter((id) => id !== null));
+      const names = new Map<string, string>();
+      if (ids.size > 0) {
+        const { data: enrollments, error: enrollmentError } = await app.supabase
+          .from('device_enrollment_names')
+          .select('recognized_user_id, display_name')
+          .eq('device_id', query.device_id)
+          .in('recognized_user_id', [...ids]);
+        if (enrollmentError) {
+          throw databaseError('Unable to load enrollment names', enrollmentError);
+        }
+        for (const enrollment of enrollments ?? []) {
+          names.set(enrollment.recognized_user_id, enrollment.display_name);
+        }
+      }
       return {
-        sessions,
+        sessions: sessions.map((session) => ({
+          ...session,
+          recognized_user_name: session.recognized_user_id
+            ? names.get(session.recognized_user_id) ?? null
+            : null,
+        })),
         next_before: sessions.length === query.limit ? sessions[sessions.length - 1]?.start_ts ?? null : null,
       };
     },

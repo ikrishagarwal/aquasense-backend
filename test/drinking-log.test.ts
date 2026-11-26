@@ -3,14 +3,20 @@ import { test } from 'node:test';
 
 const deviceId = '11111111-1111-4111-8111-111111111111';
 const userId = '22222222-2222-4222-8222-222222222222';
+const enrollmentId = '44444444-4444-4444-8444-444444444444';
 const first = {
   id: '33333333-3333-4333-8333-333333333333',
   start_ts: '2026-11-26T10:00:00.123456+00:00',
   end_ts: '2026-11-26T10:00:01+00:00',
   volume_ml: 2.25,
   tds_ppm: null,
+  recognized_user_id: enrollmentId,
+  recognized_user_name: 'Krish',
 };
-const second = { ...first, id: '33333333-3333-4333-8333-333333333332', tds_ppm: 82.35 };
+const second = {
+  ...first, id: '33333333-3333-4333-8333-333333333332', tds_ppm: 82.35,
+  recognized_user_id: null, recognized_user_name: null,
+};
 const latestTds = { tds_ppm: 84, end_ts: '2026-11-26T11:00:00+00:00' };
 
 Object.assign(process.env, {
@@ -20,6 +26,61 @@ Object.assign(process.env, {
 });
 const { buildApp } = await import('../src/app.js');
 
+test('guest logs include display names without an account link', async (t) => {
+  const unknownId = '55555555-5555-4555-8555-555555555555';
+  const guest = {
+    id: first.id, device_id: deviceId, user_id: null, recognized_user_id: enrollmentId,
+    start_ts: first.start_ts, end_ts: first.end_ts, volume_ml: first.volume_ml,
+    avg_tds_out: null, temperature_c: null, created_at: null, event_id: null, revision: null,
+    pulse_count: null, tds_in: null, ph_approx: null, sensor_quality: null, confidence: null,
+    recognition_status: null, volume_quality: null, incomplete: false, quality_flags: null,
+  };
+  let membership = true;
+  let nameLookups = 0;
+  t.mock.method(globalThis, 'fetch', async (input: Parameters<typeof fetch>[0]) => {
+    const url = new URL(String(input));
+    switch (url.pathname) {
+      case '/auth/v1/user':
+        return Response.json({ id: userId, role: 'authenticated' });
+      case '/rest/v1/device_members':
+        return Response.json(membership ? [{ device_id: deviceId, user_id: userId, role: 'member' }] : []);
+      case '/rest/v1/dispense_sessions':
+        assert.equal(url.searchParams.get('user_id'), 'is.null');
+        assert.equal(url.searchParams.get('device_id'), `eq.${deviceId}`);
+        return Response.json([
+          guest,
+          { ...guest, id: second.id, recognized_user_id: unknownId },
+          { ...guest, id: '33333333-3333-4333-8333-333333333331', recognized_user_id: null },
+        ]);
+      case '/rest/v1/device_enrollment_names':
+        nameLookups++;
+        assert.equal(url.searchParams.get('device_id'), `eq.${deviceId}`);
+        assert.equal(url.searchParams.get('recognized_user_id'), `in.(${enrollmentId},${unknownId})`);
+        return Response.json([{ recognized_user_id: enrollmentId, display_name: 'Krish' }]);
+      default:
+        throw new Error(`Unexpected request to ${url.pathname}`);
+    }
+  });
+  const app = await buildApp();
+  t.after(() => app.close());
+  function request() {
+    return app.inject({
+      url: `/v1/sessions/guests?device_id=${deviceId}`,
+      headers: { authorization: 'Bearer user-token' },
+    });
+  }
+
+  const response = await request();
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(response.json().sessions.map((row: {
+    user_id: string | null; recognized_user_name: string | null;
+  }) => [row.user_id, row.recognized_user_name]), [[null, 'Krish'], [null, null], [null, null]]);
+  assert.equal(nameLookups, 1);
+
+  membership = false;
+  assert.equal((await request()).statusCode, 403);
+  assert.equal(nameLookups, 1);
+});
 test('drinking log authenticates the caller and preserves the cursor position across pages', async (t) => {
   let rpcCalls = 0;
   let rpcResponse: { sessions: Array<typeof first | typeof second>; latest_tds: typeof latestTds | null } | null = null;

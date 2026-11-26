@@ -123,12 +123,13 @@ the Pi's `recognized_user_id` and the Supabase account assignment `user_id`.
 
 ### Roll out the mobile drinking log on Render
 
-1. Apply [migration 005](supabase/migrations/005_drinking_log.sql) to the
-   backend's Supabase project after migration 004, then deploy the backend to
-   Render.
-2. Use the Supabase SQL editor to link the Pi's recognition UUID to an account
-   that already belongs to the device. Obtain the recognition UUID from the
-   Pi's enrollment or from a known recognized pour in `dispense_sessions`.
+1. Apply [migration 005](supabase/migrations/005_drinking_log.sql) and
+   [migration 006](supabase/migrations/006_device_enrollment_names.sql) to the
+   backend's Supabase project after migration 004, then deploy the backend to Render.
+2. To enable personal drinking logs, use the Supabase SQL editor to link the
+   Pi's recognition UUID to an account that already belongs to the device.
+   Obtain the UUID from the Pi's enrollment or a known recognized pour in
+   `dispense_sessions`.
 
    ```sql
    INSERT INTO public.device_enrollment_links (device_id, recognized_user_id, user_id)
@@ -162,6 +163,22 @@ the Pi's `recognized_user_id` and the Supabase account assignment `user_id`.
    ORDER BY end_ts DESC, id DESC
    LIMIT 1;
    ```
+
+### Name a purifier enrollment
+
+Use the Supabase SQL editor after applying migration 006. A device-scoped
+display name applies to existing and future pours with that recognition UUID.
+
+```sql
+INSERT INTO public.device_enrollment_names (device_id, recognized_user_id, display_name)
+VALUES ('<device-uuid>', '<recognized-user-uuid>', '<display-name>')
+ON CONFLICT (device_id, recognized_user_id)
+DO UPDATE SET display_name = EXCLUDED.display_name;
+```
+
+For recognized pours without an account assignment, the app reads
+`GET /v1/sessions/guests?device_id=<device-uuid>` with a device member's access
+token and displays `recognized_user_name`.
 
 ### Important secret rule
 
@@ -224,6 +241,7 @@ it once after `SQL.md`.
 Apply `supabase/migrations/003_edge_v1.sql` after the membership migration.
 Apply `supabase/migrations/004_arduino_dispenses.sql` after migration 003.
 Apply `supabase/migrations/005_drinking_log.sql` after migration 004.
+Apply `supabase/migrations/006_device_enrollment_names.sql` after migration 005.
 
 ### 3.4 Enable authentication
 

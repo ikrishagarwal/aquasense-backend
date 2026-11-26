@@ -1,4 +1,4 @@
--- Run with psql -v ON_ERROR_STOP=1 -f test/drinking-log.sql against a migrated test database.
+-- Run with psql -v ON_ERROR_STOP=1 -f test/drinking-log.sql after migration 006.
 BEGIN;
 SET LOCAL plpgsql.check_asserts = on;
 
@@ -20,6 +20,10 @@ BEGIN
   ASSERT has_table_privilege('service_role', 'device_enrollment_links', 'SELECT');
   ASSERT NOT has_table_privilege('authenticated', 'device_enrollment_links', 'SELECT, INSERT, UPDATE, DELETE');
   ASSERT NOT has_table_privilege('anon', 'device_enrollment_links', 'SELECT, INSERT, UPDATE, DELETE');
+  ASSERT (SELECT relrowsecurity FROM pg_class WHERE oid = 'device_enrollment_names'::regclass);
+  ASSERT has_table_privilege('service_role', 'device_enrollment_names', 'SELECT');
+  ASSERT NOT has_table_privilege('authenticated', 'device_enrollment_names', 'SELECT, INSERT, UPDATE, DELETE');
+  ASSERT NOT has_table_privilege('anon', 'device_enrollment_names', 'SELECT, INSERT, UPDATE, DELETE');
   ASSERT has_function_privilege('service_role', 'read_drinking_log(uuid,uuid,timestamptz,uuid,integer)', 'EXECUTE');
   ASSERT NOT has_function_privilege('authenticated', 'read_drinking_log(uuid,uuid,timestamptz,uuid,integer)', 'EXECUTE');
   ASSERT NOT has_function_privilege('anon', 'read_drinking_log(uuid,uuid,timestamptz,uuid,integer)', 'EXECUTE');
@@ -39,11 +43,15 @@ BEGIN
     (gen_random_uuid(), device, NULL, enrollment, latest_end, latest_end + interval '1 second', 60, NULL, false),
     (gen_random_uuid(), device, account, enrollment, latest_end, latest_end + interval '2 seconds', 70, 90, true),
     (gen_random_uuid(), other_device, NULL, enrollment, latest_end, latest_end, 80, NULL, false),
-    (gen_random_uuid(), other_device, account, NULL, latest_end, latest_end, 90, NULL, false);
+    (gen_random_uuid(), other_device, account, enrollment, latest_end, latest_end, 90, NULL, false);
+
+  INSERT INTO device_enrollment_names (device_id, recognized_user_id, display_name)
+  VALUES (device, enrollment, 'Krish'), (other_device, enrollment, 'Other name');
 
   result := read_drinking_log(device, account, NULL, NULL, 25);
   ASSERT jsonb_array_length(result->'sessions') = 1;
   ASSERT (result #>> '{sessions,0,id}')::uuid = older_id;
+  ASSERT result #> '{sessions,0,recognized_user_name}' = 'null'::jsonb;
   ASSERT (result #>> '{latest_tds,tds_ppm}')::numeric = 0;
   ASSERT (result #>> '{latest_tds,end_ts}')::timestamptz = latest_end;
   ASSERT read_drinking_log(other_device, other_account, NULL, NULL, 25) IS NULL;
@@ -61,6 +69,8 @@ BEGIN
   RESET ROLE;
   ASSERT jsonb_array_length(result->'sessions') = 3;
   ASSERT (result #>> '{sessions,1,id}')::uuid = matched_id;
+  ASSERT (result #>> '{sessions,1,recognized_user_id}')::uuid = enrollment;
+  ASSERT result #>> '{sessions,1,recognized_user_name}' = 'Krish';
   ASSERT (result #>> '{sessions,1,volume_ml}')::numeric = 20.25;
   ASSERT result #> '{sessions,1,tds_ppm}' = 'null'::jsonb;
   ASSERT (result #>> '{sessions,2,id}')::uuid = older_id;
@@ -81,10 +91,12 @@ BEGIN
 
   result := read_drinking_log(other_device, account, NULL, NULL, 25);
   ASSERT jsonb_array_length(result->'sessions') = 1;
+  ASSERT result #>> '{sessions,0,recognized_user_name}' = 'Other name';
   ASSERT result->'latest_tds' = 'null'::jsonb;
 
   DELETE FROM device_members WHERE device_id = device AND user_id = account;
   ASSERT NOT EXISTS (SELECT FROM device_enrollment_links WHERE device_id = device);
+  ASSERT EXISTS (SELECT FROM device_enrollment_names WHERE device_id = device AND display_name = 'Krish');
   ASSERT read_drinking_log(device, account, NULL, NULL, 25) IS NULL;
 END;
 $$;

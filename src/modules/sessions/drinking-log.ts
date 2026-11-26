@@ -12,6 +12,8 @@ const session = z.object({
   end_ts: timestamp,
   volume_ml: z.number().nonnegative(),
   tds_ppm: z.number().nullable(),
+  recognized_user_id: z.string().uuid().nullable(),
+  recognized_user_name: z.string().nullable(),
 });
 const log = z.object({
   sessions: z.array(session),

@@ -185,6 +185,7 @@ supabase/migrations/002_device_members.sql
 supabase/migrations/003_edge_v1.sql
 supabase/migrations/004_arduino_dispenses.sql
 supabase/migrations/005_drinking_log.sql
+supabase/migrations/006_device_enrollment_names.sql
 ```
 
 You can paste these into the Supabase SQL Editor or apply them with the
@@ -366,7 +367,9 @@ reading for the device.
       "start_ts": "2026-11-26T10:00:00Z",
       "end_ts": "2026-11-26T10:00:03Z",
       "volume_ml": 180.5,
-      "tds_ppm": 82.35
+      "tds_ppm": 82.35,
+      "recognized_user_id": "44444444-4444-4444-8444-444444444444",
+      "recognized_user_name": "Alex"
     }
   ],
   "next_cursor": null,
@@ -383,6 +386,8 @@ last page. A session's `tds_ppm` is null if the pour has no reading.
 `latest_tds` is the recorded outlet reading from the most recently ended
 completed pour on the device with a reading, across all accounts and guests.
 It is null if the device has no such reading.
+The recognition fields contain the purifier enrollment ID and its registered
+display name, or null for either value when it is unavailable.
 
 ### Claim a device
 
@@ -465,7 +470,9 @@ GET /v1/sessions/guests?device_id=<device-uuid>&limit=25&before=<iso-timestamp>
 
 Returns unassigned sessions (`user_id IS NULL`) newest first. `limit` defaults
 to `25` and is capped at `100`. Use the returned `next_before` timestamp for
-the next page.
+the next page. Device members can use this endpoint to display recognized pours
+before linking enrollments to accounts. Each session includes
+`recognized_user_id` and `recognized_user_name`. A missing name is null.
 
 ### Assign a guest session
 
@@ -565,6 +572,7 @@ this order:
 3. `supabase/migrations/003_edge_v1.sql`.
 4. `supabase/migrations/004_arduino_dispenses.sql`.
 5. `supabase/migrations/005_drinking_log.sql`.
+6. `supabase/migrations/006_device_enrollment_names.sql`.
 5. Supabase Auth and Realtime dashboard configuration.
 
 The migration backfills profiles from existing `auth.users` rows and creates
@@ -699,8 +707,8 @@ test or a live broker test. After applying the migration, manually verify:
 
 Run `psql -v ON_ERROR_STOP=1 -f test/edge-v1.sql` against a migrated test database for commit, revision, drain and outbox assertions. The fixtures roll back.
 
-Run `psql -v ON_ERROR_STOP=1 -f test/drinking-log.sql` after migration 005 to
-verify enrollment links, account and device isolation, pagination, and TDS.
+Run `psql -v ON_ERROR_STOP=1 -f test/drinking-log.sql` after migration 006 to
+verify enrollment links and names, account and device isolation, pagination, and TDS.
 The fixtures roll back.
 
 ## Operational notes and limitations
