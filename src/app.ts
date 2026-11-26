@@ -20,6 +20,7 @@ import healthRoutes from './modules/health/routes.js';
 import devicesRoutes from './modules/devices/routes.js';
 import sessionsRoutes from './modules/sessions/routes.js';
 import dashboardRoutes from './modules/dashboard/routes.js';
+import edgeDispenseRoutes from './modules/edge-dispenses/routes.js';
 import { AppError } from './lib/errors.js';
 
 export async function buildApp() {
@@ -91,14 +92,17 @@ export async function buildApp() {
   });
 
   await app.register(supabasePlugin);
-  await app.register(authPlugin);
   await app.register(mqttPlugin);
   await app.register(edgeWorkers);
-  await app.register(notificationsRoutes);
-  await app.register(healthRoutes);
-  await app.register(devicesRoutes);
-  await app.register(sessionsRoutes);
-  await app.register(dashboardRoutes);
+  await app.register(edgeDispenseRoutes);
+  await app.register(async (userApi) => {
+    await userApi.register(authPlugin);
+    await userApi.register(notificationsRoutes);
+    await userApi.register(healthRoutes);
+    await userApi.register(devicesRoutes);
+    await userApi.register(sessionsRoutes);
+    await userApi.register(dashboardRoutes);
+  });
 
   return app;
 }

@@ -88,6 +88,8 @@ export default fp(async (app) => {
     app.log.warn('MQTT is disabled by configuration');
     return;
   }
+  const brokerUrl = config.MQTT_URL;
+  if (!brokerUrl) throw Error('MQTT_URL is required when MQTT is enabled');
 
   app.addHook('onReady', async () => {
     const options: IClientOptions = {
@@ -98,7 +100,7 @@ export default fp(async (app) => {
       reconnectPeriod: 5_000,
       connectTimeout: 10_000,
     };
-    client = mqtt.connect(config.MQTT_URL, options);
+    client = mqtt.connect(brokerUrl, options);
 
     client.on('connect', () => {
       connected = false;

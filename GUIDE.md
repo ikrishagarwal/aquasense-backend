@@ -73,8 +73,53 @@ If Supabase is configured but MQTT is not ready yet, set:
 MQTT_ENABLED=false
 ```
 
-The backend starts without MQTT. Telemetry ingestion and drain dispatch require
-a broker connection. An undispatched drain request expires after 15 seconds.
+The backend starts without MQTT settings. Telemetry ingestion and drain dispatch
+require a broker connection. An undispatched drain request expires after 15 seconds.
+
+### Arduino HTTPS delivery on Render
+
+1. Apply [the Arduino dispense migration](supabase/migrations/004_arduino_dispenses.sql)
+   after migrations 002 and 003, using the project's usual migration workflow.
+   Generate a stable device UUID once for a new Pi, or use the Pi's existing
+   provisioned UUID. For a new device, insert it with a name in Supabase.
+
+   ```sql
+   INSERT INTO public.devices (id, name)
+   VALUES ('<stable-device-uuid>', 'Arduino purifier')
+   ON CONFLICT (id) DO NOTHING;
+   ```
+
+2. Generate one random token per device with `openssl rand -hex 32`. Store
+   `AQUASENSE_DEVICE_TOKENS` in Render as a JSON object of the form
+   `{"<stable-device-uuid>":"<per-device-token>"}`. Set
+   `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` in Render. Set
+   `MQTT_ENABLED=false` for HTTP-only operation.
+3. Deploy the backend source as a Render Node web service. Use
+   `pnpm install --frozen-lockfile && pnpm build` to build, `pnpm start` to
+   start, and `/health` for the health check. Set `NODE_VERSION=26.2.0` and
+   use pnpm 11.5.2 to match local verification. Render supplies `PORT` and the
+   app defaults to `HOST=0.0.0.0`.
+   [Render Fastify setup](https://render.com/docs/deploy-node-fastify-app)
+   [Render Node.js version settings](https://render.com/docs/node-version)
+4. Set `AQUASENSE_BACKEND_URL` to the Render HTTPS origin on the Pi, with
+   `AQUASENSE_DEVICE_ID` and `AQUASENSE_DEVICE_TOKEN` matching the Render
+   secret. Start the monitor with its active vision config and make a recognized
+   pour. Compare the console summary with the latest session for that device.
+
+   ```sql
+   SELECT event_id, recognized_user_id, user_id, start_ts, end_ts,
+          volume_ml, avg_tds_out
+   FROM public.dispense_sessions
+   WHERE device_id = '<stable-device-uuid>'
+   ORDER BY start_ts DESC
+   LIMIT 1;
+   ```
+
+`POST /v1/edge/dispenses` returns `200` with `{"status":"committed"}` after the
+transaction commits, including for an identical retry. Reusing the event ID
+with changed data returns `409`. The route accepts UTC timestamps with
+up to six fractional digits. The authorized session endpoints include both
+the Pi's `recognized_user_id` and the Supabase account assignment `user_id`.
 
 ### Important secret rule
 
@@ -135,6 +180,7 @@ workflow. If using the dashboard, paste the file into the SQL Editor and run
 it once after `SQL.md`.
 
 Apply `supabase/migrations/003_edge_v1.sql` after the membership migration.
+Apply `supabase/migrations/004_arduino_dispenses.sql` after migration 003.
 
 ### 3.4 Enable authentication
 

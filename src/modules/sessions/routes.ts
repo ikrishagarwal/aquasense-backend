@@ -11,6 +11,7 @@ const sessionSchema = z.object({
   id: sessionId,
   device_id: deviceId,
   user_id: z.string().uuid().nullable(),
+  recognized_user_id: z.string().uuid().nullable(),
   volume_ml: z.number().nonnegative(),
   avg_tds_out: z.number().nullable(),
   temperature_c: z.number().nullable(),
@@ -30,7 +31,7 @@ const sessionSchema = z.object({
   quality_flags: z.array(z.string()).nullable(),
 });
 
-const sessionColumns = 'id, device_id, user_id, volume_ml, avg_tds_out, temperature_c, start_ts, end_ts, created_at, event_id, revision, pulse_count, tds_in, ph_approx, sensor_quality, confidence, recognition_status, volume_quality, incomplete, quality_flags';
+const sessionColumns = 'id, device_id, user_id, recognized_user_id, volume_ml, avg_tds_out, temperature_c, start_ts, end_ts, created_at, event_id, revision, pulse_count, tds_in, ph_approx, sensor_quality, confidence, recognition_status, volume_quality, incomplete, quality_flags';
 
 function databaseError(message: string, error: { message: string }) {
   return new AppError(500, 'DATABASE_ERROR', message, error.message);

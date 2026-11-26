@@ -183,6 +183,7 @@ Run the base statements in [`SQL.md`](./SQL.md), then run:
 ```text
 supabase/migrations/002_device_members.sql
 supabase/migrations/003_edge_v1.sql
+supabase/migrations/004_arduino_dispenses.sql
 ```
 
 You can paste these into the Supabase SQL Editor or apply them with the
@@ -244,10 +245,11 @@ required value is missing.
 | `LOG_LEVEL` | No | `info` | Fastify/Pino log level. |
 | `SUPABASE_URL` | Yes | — | Project URL, for example `https://project.supabase.co`. |
 | `SUPABASE_SERVICE_ROLE_KEY` | Yes | — | Server-only Supabase service-role key. Never expose it to a mobile app. |
-| `MQTT_URL` | Yes | — | Broker URL, normally `mqtts://...:8883`. |
-| `MQTT_USERNAME` | Yes | — | MQTT broker username. |
-| `MQTT_PASSWORD` | Yes | — | MQTT broker password. |
-| `MQTT_ENABLED` | No | `true` | Set to `false` for HTTP-only local smoke tests. |
+| `MQTT_URL` | With MQTT enabled | — | Broker URL, normally `mqtts://...:8883`. |
+| `MQTT_USERNAME` | With MQTT enabled | — | MQTT broker username. |
+| `MQTT_PASSWORD` | With MQTT enabled | — | MQTT broker password. |
+| `MQTT_ENABLED` | No | `true` | Set to `false` for HTTP-only deployments. |
+| `AQUASENSE_DEVICE_TOKENS` | With Arduino HTTPS delivery | `{}` | Secret JSON object mapping device UUIDs to distinct bearer tokens. |
 | `DEVICE_ONLINE_WINDOW_MINUTES` | No | `5` | Maximum age of a device heartbeat for commands. |
 | `COMMAND_RATE_LIMIT_MS` | No | `10000` | Minimum time between commands for one device. |
 | `DRAIN_MAX_DURATION_S` | No | `15` | Maximum accepted drain duration in seconds (up to 15). |
@@ -521,7 +523,8 @@ this order:
 1. Base schema from `SQL.md`.
 2. `supabase/migrations/002_device_members.sql`.
 3. `supabase/migrations/003_edge_v1.sql`.
-4. Supabase Auth and Realtime dashboard configuration.
+4. `supabase/migrations/004_arduino_dispenses.sql`.
+5. Supabase Auth and Realtime dashboard configuration.
 
 The migration backfills profiles from existing `auth.users` rows and creates
 memberships for existing non-null `devices.owner_id` values.

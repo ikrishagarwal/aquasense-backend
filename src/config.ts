@@ -8,17 +8,37 @@ const envSchema = z.object({
   LOG_LEVEL: z.string().default('info'),
   SUPABASE_URL: z.string().url(),
   SUPABASE_SERVICE_ROLE_KEY: z.string().min(1),
-  MQTT_URL: z.string().min(1),
-  MQTT_USERNAME: z.string().min(1),
-  MQTT_PASSWORD: z.string().min(1),
+  MQTT_URL: z.string().optional(),
+  MQTT_USERNAME: z.string().optional(),
+  MQTT_PASSWORD: z.string().optional(),
   MQTT_ENABLED: z.enum(['true', 'false']).default('true').transform((value) => value === 'true'),
+  AQUASENSE_DEVICE_TOKENS: z.string().default('{}').transform((value, ctx) => {
+    try {
+      const tokens = z.record(z.uuid(), z.string().regex(/^[A-Za-z0-9._~+/-]+=*$/)).parse(JSON.parse(value));
+      const entries = Object.entries(tokens).map(([id, token]) => [id.toLowerCase(), token] as const);
+      const mapping = new Map(entries);
+      if (mapping.size === entries.length && new Set(mapping.values()).size === mapping.size) {
+        return mapping;
+      }
+    } catch {
+      // Configuration diagnostics must never contain tokens.
+    }
+    ctx.addIssue({ code: 'custom', message: 'Expected a JSON object mapping device UUIDs to distinct bearer tokens' });
+    return z.NEVER;
+  }),
   DEVICE_ONLINE_WINDOW_MINUTES: z.coerce.number().positive().default(5),
   COMMAND_RATE_LIMIT_MS: z.coerce.number().int().nonnegative().default(10_000),
   DRAIN_MAX_DURATION_S: z.coerce.number().positive().max(15).default(15),
   MQTT_CA_PATH: z.string().optional(),
   FCM_SERVICE_ACCOUNT_PATH: z.string().optional(),
-}).refine(env => !env.MQTT_ENABLED || /^mqtts:\/\//.test(env.MQTT_URL), {
-  path: ['MQTT_URL'], message: 'MQTT requires a verified mqtts:// connection',
+}).superRefine((env, ctx) => {
+  if (!env.MQTT_ENABLED) return;
+  if (!env.MQTT_URL?.startsWith('mqtts://')) {
+    ctx.addIssue({ code: 'custom', path: ['MQTT_URL'], message: 'MQTT requires a verified mqtts:// connection' });
+  }
+  for (const field of ['MQTT_USERNAME', 'MQTT_PASSWORD'] as const) {
+    if (!env[field]) ctx.addIssue({ code: 'custom', path: [field], message: 'Required when MQTT is enabled' });
+  }
 });
 
 export type AppConfig = z.infer<typeof envSchema>;
