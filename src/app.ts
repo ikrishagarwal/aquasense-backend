@@ -19,6 +19,7 @@ import mqttPlugin from './plugins/mqtt.js';
 import healthRoutes from './modules/health/routes.js';
 import devicesRoutes from './modules/devices/routes.js';
 import sessionsRoutes from './modules/sessions/routes.js';
+import drinkingLogRoutes from './modules/sessions/drinking-log.js';
 import dashboardRoutes from './modules/dashboard/routes.js';
 import edgeDispenseRoutes from './modules/edge-dispenses/routes.js';
 import { AppError } from './lib/errors.js';
@@ -101,6 +102,7 @@ export async function buildApp() {
     await userApi.register(healthRoutes);
     await userApi.register(devicesRoutes);
     await userApi.register(sessionsRoutes);
+    await userApi.register(drinkingLogRoutes);
     await userApi.register(dashboardRoutes);
   });
 

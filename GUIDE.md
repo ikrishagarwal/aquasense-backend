@@ -107,7 +107,7 @@ require a broker connection. An undispatched drain request expires after 15 seco
    pour. Compare the console summary with the latest session for that device.
 
    ```sql
-   SELECT event_id, recognized_user_id, user_id, start_ts, end_ts,
+   SELECT id, event_id, recognized_user_id, user_id, start_ts, end_ts,
           volume_ml, avg_tds_out
    FROM public.dispense_sessions
    WHERE device_id = '<stable-device-uuid>'
@@ -120,6 +120,48 @@ transaction commits, including for an identical retry. Reusing the event ID
 with changed data returns `409`. The route accepts UTC timestamps with
 up to six fractional digits. The authorized session endpoints include both
 the Pi's `recognized_user_id` and the Supabase account assignment `user_id`.
+
+### Roll out the mobile drinking log on Render
+
+1. Apply [migration 005](supabase/migrations/005_drinking_log.sql) to the
+   backend's Supabase project after migration 004, then deploy the backend to
+   Render.
+2. Use the Supabase SQL editor to link the Pi's recognition UUID to an account
+   that already belongs to the device. Obtain the recognition UUID from the
+   Pi's enrollment or from a known recognized pour in `dispense_sessions`.
+
+   ```sql
+   INSERT INTO public.device_enrollment_links (device_id, recognized_user_id, user_id)
+   VALUES ('<device-uuid>', '<recognized-user-uuid>', '<account-uuid>')
+   ON CONFLICT (device_id, recognized_user_id)
+   DO UPDATE SET user_id = EXCLUDED.user_id;
+   ```
+
+   The link applies to past and future pours that have no explicit account
+   assignment. Removing the account's device membership deletes its links.
+3. Sign in as the linked account and use its Supabase access token to request
+   the log from Render. Set `RENDER_BACKEND_URL`, `DEVICE_ID`, and
+   `MOBILE_ACCESS_TOKEN` for this smoke test.
+
+   ```sh
+   curl --fail-with-body --silent --show-error \
+     -H "Authorization: Bearer ${MOBILE_ACCESS_TOKEN}" \
+     "${RENDER_BACKEND_URL}/v1/devices/${DEVICE_ID}/drinking-log?limit=25"
+   ```
+
+   Verify that `sessions` contains the ID of the account's known recognized
+   pour and that `latest_tds` matches the reading and end timestamp from this
+   query. The two results can come from different pours.
+
+   ```sql
+   SELECT avg_tds_out AS tds_ppm, end_ts
+   FROM public.dispense_sessions
+   WHERE device_id = '<device-uuid>'
+     AND incomplete IS NOT TRUE
+     AND avg_tds_out IS NOT NULL
+   ORDER BY end_ts DESC, id DESC
+   LIMIT 1;
+   ```
 
 ### Important secret rule
 
@@ -181,6 +223,7 @@ it once after `SQL.md`.
 
 Apply `supabase/migrations/003_edge_v1.sql` after the membership migration.
 Apply `supabase/migrations/004_arduino_dispenses.sql` after migration 003.
+Apply `supabase/migrations/005_drinking_log.sql` after migration 004.
 
 ### 3.4 Enable authentication
 
